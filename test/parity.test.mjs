@@ -58,14 +58,19 @@ test('allowlist covers properties @nativescript/core parses', async () => {
 	}
 });
 
-test('unrolls translate/scale shorthands onto core per-axis properties', async () => {
+test('wires translate/scale vars onto core per-axis properties', async () => {
 	assert.equal(
-		await run('.x{--tw-translate-x:4;translate:var(--tw-translate-x) var(--tw-translate-y)}'),
-		'.x{--tw-translate-x:4;translateX:var(--tw-translate-x, 0);translateY:var(--tw-translate-y, 0)}',
+		await run('.x{--tw-translate-x:calc(var(--spacing) * 4);translate:var(--tw-translate-x) var(--tw-translate-y)}'),
+		'.x{translateX:calc(var(--spacing) * 4)}',
 	);
 	assert.equal(
 		await run('.x{--tw-scale-x:95%;--tw-scale-y:95%;scale:var(--tw-scale-x) var(--tw-scale-y)}'),
-		'.x{--tw-scale-x:95%;--tw-scale-y:95%;scaleX:var(--tw-scale-x, 1);scaleY:var(--tw-scale-y, 1)}',
+		'.x{scaleX:0.95;scaleY:0.95}',
+	);
+	// literal shorthand args still unroll
+	assert.equal(
+		await run('.x{translate:10px 20px;scale:0.5}'),
+		'.x{translateX:10px;translateY:20px;scaleX:0.5;scaleY:0.5}',
 	);
 });
 
