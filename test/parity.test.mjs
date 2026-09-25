@@ -58,24 +58,28 @@ test('allowlist covers properties @nativescript/core parses', async () => {
 	}
 });
 
-test('merges translate/scale pieces into a single transform shorthand', async () => {
+test('emits a var-composed transform: shorthand with literal --tw-* values', async () => {
+	const T =
+		'transform:translateX(var(--tw-translate-x, 0)) translateY(var(--tw-translate-y, 0)) ' +
+		'scaleX(var(--tw-scale-x, 1)) scaleY(var(--tw-scale-y, 1))';
+	// --tw-* decls keep their names but values resolve to literals
 	assert.equal(
 		await run('.x{--tw-translate-x:calc(var(--spacing) * 4);translate:var(--tw-translate-x) var(--tw-translate-y)}'),
-		'.x{transform:translateX(16)}',
+		`.x{${T};--tw-translate-x:16}`,
 	);
 	assert.equal(
 		await run('.x{--tw-scale-x:95%;--tw-scale-y:95%;scale:var(--tw-scale-x) var(--tw-scale-y)}'),
-		'.x{transform:scaleX(0.95) scaleY(0.95)}',
+		`.x{${T};--tw-scale-x:0.95;--tw-scale-y:0.95}`,
 	);
 	// --spacing value from the stylesheet governs the spacing-var resolution
 	assert.equal(
 		await run('.r{--spacing:8}.x{--tw-translate-y:calc(var(--spacing) * 2)}'),
-		'.r{--spacing:8}.x{transform:translateY(16)}',
+		`.r{--spacing:8}.x{${T};--tw-translate-y:16}`,
 	);
-	// literal shorthand args unroll into transform functions
+	// literal shorthand args bake into the matching axis slot
 	assert.equal(
-		await run('.x{translate:10px 20px;scale:0.5}'),
-		'.x{transform:translateX(10) translateY(20) scaleX(0.5) scaleY(0.5)}',
+		await run('.x{translate:10px 20px}'),
+		'.x{transform:translateX(10) translateY(20) scaleX(var(--tw-scale-x, 1)) scaleY(var(--tw-scale-y, 1))}',
 	);
 });
 

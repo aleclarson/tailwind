@@ -198,20 +198,24 @@ const logicalToPhysical = {
 };
 
 /**
- * Tailwind v4 transform utilities set `--tw-translate-*`/`--tw-scale-*` custom
- * properties in the same rule, then apply them via `translate:`/`scale:`
- * shorthand declarations — neither the shorthands nor element-scoped
- * var() resolution exist in core's engine, and per-axis props
+ * Tailwind v4 transform utilities set `--tw-translate-*`/`--tw-scale-*`
+ * custom properties in the same rule, then apply them via `translate:`/
+ * `scale:` shorthands — neither shorthand exists on core, per-axis props
  * (translateX/scaleX/scaleY) are animation-only and never apply through
- * the stylesheet. The only door core opens is the `transform:` shorthand
- * via transformConverter — and it needs literal numbers (parseFloat on
- * 'translateX(N)'), so calc()/var() must be resolved here.
+ * the stylesheet, and `transform:` is the only door in.
  *
- * All transform pieces in a rule are merged into ONE decl: the shorthand
- * resets every axis, so two `transform:` decls in a rule would be
- * last-wins, and per-utility rules can't compose on an element anyway
- * (translate-x-* + scale-* on one view: the later stylesheet rule wins —
- * a core cascade limitation, not something PostCSS can merge).
+ * Composition strategy: the `transform:` value passes through core's
+ * var() substitution before transformConverter parses it, so every
+ * utility emits the FULL four-axis expression reading the other
+ * utilities' --tw-* vars with identity fallbacks. Last rule wins the
+ * transform decl but resolves *all* applied vars — translate-x-* +
+ * scale-* on one element composes, same var mechanism as the web.
+ *
+ * The catch: core doesn't resolve nested var()/calc() — a --tw-* value
+ * like 'calc(var(--spacing) * 4)' would re-introduce a var at the
+ * use site. So the --tw-* decl VALUES are rewritten to literal numbers
+ * (--spacing × N for the spacing-calc form, %→factor for scale,
+ * rem→dips), making every var() single-hop.
  */
 const transformVarToFn = {
 	"--tw-translate-x": "translateX",
@@ -219,10 +223,14 @@ const transformVarToFn = {
 	"--tw-scale-x": "scaleX",
 	"--tw-scale-y": "scaleY",
 };
+const TRANSFORM_VALUE =
+	"translateX(var(--tw-translate-x, 0)) " +
+	"translateY(var(--tw-translate-y, 0)) " +
+	"scaleX(var(--tw-scale-x, 1)) " +
+	"scaleY(var(--tw-scale-y, 1))";
 
 // dip value of 1 × --spacing (theme.css ships --spacing: .25rem → 4)
 const rootSpacing = new WeakMap();
-const mergedTransformRules = new WeakSet();
 function resolveSpacing(root) {
 	if (rootSpacing.has(root)) return rootSpacing.get(root);
 	let value = 4;
@@ -235,7 +243,7 @@ function resolveSpacing(root) {
 	return value;
 }
 
-// Resolve a transform arg to a number for translateX(N)/scaleX(N).
+// Resolve a --tw-* arg to a literal for translateX(N)/scaleX(N).
 // 'calc(var(--spacing) * 4)' → spacing × 4; '95%' → 0.95 (scale);
 // '16px'/'-8'/'1rem' → number (rem → ×16).
 function resolveTransformArg(raw, isScale, root) {
@@ -257,6 +265,9 @@ function resolveTransformArg(raw, isScale, root) {
 	if (isScale) return v.endsWith("%") ? n / 100 : n;
 	return v.endsWith("rem") || v.endsWith("em") ? n * 16 : n;
 }
+
+// Rules already merged — re-entering per decl would double-emit.
+const mergedTransformRules = new WeakSet();
 
 function isSupportedProperty(prop, val = null) {
 	const rules = supportedProperties[prop];
@@ -499,9 +510,9 @@ module.exports = (options = { debug: false }) => {
 					});
 			}
 
-			// Merge --tw-translate-*/--tw-scale-* + translate:/scale: into a
-			// single `transform:` shorthand — the only path that applies
-			// transforms via stylesheet on core.
+			// Transform utilities: rewrite --tw-* values to literals so the
+			// shared transform decl's var()s resolve single-hop, then emit
+			// `transform:` once per rule (literal shorthand args get baked in).
 			if (
 				decl.prop in transformVarToFn ||
 				decl.prop === "translate" ||
@@ -509,42 +520,56 @@ module.exports = (options = { debug: false }) => {
 			) {
 				const rule = decl.parent;
 				if (mergedTransformRules.has(rule)) {
-					return decl.remove();
+					// merge already ran — leave remaining decls (the --tw-*
+					// vars are the composition channel and must survive)
+					return;
 				}
 				mergedTransformRules.add(rule);
 
-				const parts = [];
-				const removals = [];
+				// literal pieces from translate:/scale: shorthands override
+				// the matching var() slot
+				const parts = {
+					tx: "var(--tw-translate-x, 0)",
+					ty: "var(--tw-translate-y, 0)",
+					sx: "var(--tw-scale-x, 1)",
+					sy: "var(--tw-scale-y, 1)",
+				};
+				let hasTransform = false;
 				for (const sib of rule.nodes ?? []) {
 					if (sib.type !== "decl") continue;
 					const fn = transformVarToFn[sib.prop];
 					if (fn) {
 						const v = resolveTransformArg(sib.value, fn.startsWith("scale"), decl.root());
-						if (v != null) parts.push(`${fn}(${v})`);
-						removals.push(sib);
+						if (v != null) {
+							sib.value = `${v}`;
+						}
+						hasTransform = true;
 					} else if (sib.prop === "translate" || sib.prop === "scale") {
-						// literal-args shorthand (hand CSS) unrolls into functions;
-						// var(--tw-*) args are covered by the --tw-* decls above
 						const isS = sib.prop === "scale";
 						if (sib.value.trim() !== "none" && !sib.value.includes("var(")) {
 							const [x, y] = splitArgs(sib.value);
 							const xv = resolveTransformArg(x, isS, decl.root());
-							if (xv != null) parts.push(`${isS ? "scaleX" : "translateX"}(${xv})`);
+							if (xv != null) parts[isS ? "sx" : "tx"] = `${xv}`;
 							const yv = y ?? (isS ? x : undefined);
-							const yr =
-								yv !== undefined ? resolveTransformArg(yv, isS, decl.root()) : null;
-							if (yr != null) parts.push(`${isS ? "scaleY" : "translateY"}(${yr})`);
+							const yr = yv !== undefined ? resolveTransformArg(yv, isS, decl.root()) : null;
+							if (yr != null) parts[isS ? "sy" : "ty"] = `${yr}`;
 						}
-						removals.push(sib);
+						hasTransform = true;
+						sib.remove();
 					}
 				}
-				if (parts.length) {
-					rule.insertBefore(decl, decl.clone({ prop: "transform", value: parts.join(" ") }));
+				if (hasTransform) {
+					const value =
+						`translateX(${parts.tx}) translateY(${parts.ty}) ` +
+						`scaleX(${parts.sx}) scaleY(${parts.sy})`;
+					rule.insertBefore(decl, decl.clone({ prop: "transform", value }));
 				}
-				for (const node of removals) {
-					if (node !== decl) node.remove();
+				// shorthand decls get folded into transform; --tw-* vars stay
+				// (rewritten to literals — they're the composition channel)
+				if (decl.prop === "translate" || decl.prop === "scale") {
+					return decl.remove();
 				}
-				return decl.remove();
+				return;
 			}
 
 			// remove unsupported properties
