@@ -201,20 +201,61 @@ const logicalToPhysical = {
  * Tailwind v4 transform utilities set `--tw-translate-*`/`--tw-scale-*` custom
  * properties in the same rule, then apply them via `translate:`/`scale:`
  * shorthand declarations — neither the shorthands nor element-scoped
- * var() resolution exist in core's engine. Rewire the custom-property
- * declarations onto core's per-axis properties directly: the values are
- * concrete (`calc(var(--spacing) * 4)`, `95%`), which core *can* evaluate.
+ * var() resolution exist in core's engine, and per-axis props
+ * (translateX/scaleX/scaleY) are animation-only and never apply through
+ * the stylesheet. The only door core opens is the `transform:` shorthand
+ * via transformConverter — and it needs literal numbers (parseFloat on
+ * 'translateX(N)'), so calc()/var() must be resolved here.
+ *
+ * All transform pieces in a rule are merged into ONE decl: the shorthand
+ * resets every axis, so two `transform:` decls in a rule would be
+ * last-wins, and per-utility rules can't compose on an element anyway
+ * (translate-x-* + scale-* on one view: the later stylesheet rule wins —
+ * a core cascade limitation, not something PostCSS can merge).
  */
-const twVarToAxis = {
+const transformVarToFn = {
 	"--tw-translate-x": "translateX",
 	"--tw-translate-y": "translateY",
 	"--tw-scale-x": "scaleX",
 	"--tw-scale-y": "scaleY",
 };
 
-// Core scaleX/scaleY take a unitless factor, not a percent — '95%' -> 0.95.
-function normalizeScaleValue(value) {
-	return value.replace(/(\d+(?:\.\d+)?)%/g, (_, n) => `${parseFloat(n) / 100}`);
+// dip value of 1 × --spacing (theme.css ships --spacing: .25rem → 4)
+const rootSpacing = new WeakMap();
+const mergedTransformRules = new WeakSet();
+function resolveSpacing(root) {
+	if (rootSpacing.has(root)) return rootSpacing.get(root);
+	let value = 4;
+	root.walkDecls("--spacing", (decl) => {
+		const n = parseFloat(decl.value);
+		if (Number.isNaN(n)) return;
+		value = decl.value.includes("rem") || decl.value.includes("em") ? n * 16 : n;
+	});
+	rootSpacing.set(root, value);
+	return value;
+}
+
+// Resolve a transform arg to a number for translateX(N)/scaleX(N).
+// 'calc(var(--spacing) * 4)' → spacing × 4; '95%' → 0.95 (scale);
+// '16px'/'-8'/'1rem' → number (rem → ×16).
+function resolveTransformArg(raw, isScale, root) {
+	const v = raw.trim();
+	const spacingCalc = v.match(/^calc\(var\(--spacing\)\s*\*\s*(-?[\d.]+)\)$/);
+	if (spacingCalc) {
+		return resolveSpacing(root) * parseFloat(spacingCalc[1]);
+	}
+	if (v.includes("var(")) return null;
+	const plainCalc = v.match(/^calc\((-?[\d.]+)\s*([*+/])\s*(-?[\d.]+)\)$/);
+	if (plainCalc) {
+		const [, a, op, b] = plainCalc;
+		const x = parseFloat(a);
+		const y = parseFloat(b);
+		return op === "*" ? x * y : op === "+" ? x + y : x / y;
+	}
+	const n = parseFloat(v);
+	if (Number.isNaN(n)) return null;
+	if (isScale) return v.endsWith("%") ? n / 100 : n;
+	return v.endsWith("rem") || v.endsWith("em") ? n * 16 : n;
 }
 
 function isSupportedProperty(prop, val = null) {
@@ -458,56 +499,51 @@ module.exports = (options = { debug: false }) => {
 					});
 			}
 
-			// --tw-translate-x → translateX etc: the utility's own value
-			// declaration, rewired onto the per-axis property core exposes.
-			// postcss-preset-env runs ahead of us and clones var()-carrying
-			// decls into statically-substituted twins; core's evaluator chokes
-			// on var() inside calc (e.g. calc(var(--spacing) * 4) resolves to
-			// '.25rem', which the calc parser rejects -> unset -> default), so
-			// the LAST declaration must be the static one — drop ours when a
-			// var-free sibling exists.
-			const axis = twVarToAxis[decl.prop];
-			if (axis) {
-				if (decl.value.includes("var(")) {
-					const staticTwin = (decl.parent.nodes ?? []).some(
-						(sib) =>
-							sib !== decl &&
-							sib.type === "decl" &&
-							// twins emitted later still carry --tw-*; ones visited
-							// already were renamed onto the axis prop
-							(sib.prop === decl.prop || sib.prop === axis) &&
-							!sib.value.includes("var("),
-					);
-					if (staticTwin) {
-						return decl.remove();
-					}
-				}
-				decl.prop = axis;
-				if (axis.startsWith("scale")) {
-					decl.value = normalizeScaleValue(decl.value);
-				}
-				return;
-			}
-
-			// `translate:`/`scale:` shorthands. Literal args (rare — hand CSS)
-			// unroll onto the per-axis properties; var(--tw-*) args are
-			// redundant now — the values come from the renamed declarations
-			// above and var() would evaluate to unset.
-			if (decl.prop === "translate" || decl.prop === "scale") {
-				const isScale = decl.prop === "scale";
-				if (decl.value.trim() === "none" || decl.value.includes("var(")) {
+			// Merge --tw-translate-*/--tw-scale-* + translate:/scale: into a
+			// single `transform:` shorthand — the only path that applies
+			// transforms via stylesheet on core.
+			if (
+				decl.prop in transformVarToFn ||
+				decl.prop === "translate" ||
+				decl.prop === "scale"
+			) {
+				const rule = decl.parent;
+				if (mergedTransformRules.has(rule)) {
 					return decl.remove();
 				}
-				const [x, y] = splitArgs(decl.value);
-				// scale: <v> applies to both axes; translate: <v> leaves y at 0.
-				const yv = y ?? (isScale ? x : undefined);
-				const decls = [
-					decl.clone({ prop: isScale ? "scaleX" : "translateX", value: isScale ? normalizeScaleValue(x) : x }),
-					...(yv !== undefined
-						? [decl.clone({ prop: isScale ? "scaleY" : "translateY", value: isScale ? normalizeScaleValue(yv) : yv })]
-						: []),
-				];
-				decl.parent.insertAfter(decl, decls);
+				mergedTransformRules.add(rule);
+
+				const parts = [];
+				const removals = [];
+				for (const sib of rule.nodes ?? []) {
+					if (sib.type !== "decl") continue;
+					const fn = transformVarToFn[sib.prop];
+					if (fn) {
+						const v = resolveTransformArg(sib.value, fn.startsWith("scale"), decl.root());
+						if (v != null) parts.push(`${fn}(${v})`);
+						removals.push(sib);
+					} else if (sib.prop === "translate" || sib.prop === "scale") {
+						// literal-args shorthand (hand CSS) unrolls into functions;
+						// var(--tw-*) args are covered by the --tw-* decls above
+						const isS = sib.prop === "scale";
+						if (sib.value.trim() !== "none" && !sib.value.includes("var(")) {
+							const [x, y] = splitArgs(sib.value);
+							const xv = resolveTransformArg(x, isS, decl.root());
+							if (xv != null) parts.push(`${isS ? "scaleX" : "translateX"}(${xv})`);
+							const yv = y ?? (isS ? x : undefined);
+							const yr =
+								yv !== undefined ? resolveTransformArg(yv, isS, decl.root()) : null;
+							if (yr != null) parts.push(`${isS ? "scaleY" : "translateY"}(${yr})`);
+						}
+						removals.push(sib);
+					}
+				}
+				if (parts.length) {
+					rule.insertBefore(decl, decl.clone({ prop: "transform", value: parts.join(" ") }));
+				}
+				for (const node of removals) {
+					if (node !== decl) node.remove();
+				}
 				return decl.remove();
 			}
 

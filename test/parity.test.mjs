@@ -58,19 +58,24 @@ test('allowlist covers properties @nativescript/core parses', async () => {
 	}
 });
 
-test('wires translate/scale vars onto core per-axis properties', async () => {
+test('merges translate/scale pieces into a single transform shorthand', async () => {
 	assert.equal(
 		await run('.x{--tw-translate-x:calc(var(--spacing) * 4);translate:var(--tw-translate-x) var(--tw-translate-y)}'),
-		'.x{translateX:calc(var(--spacing) * 4)}',
+		'.x{transform:translateX(16)}',
 	);
 	assert.equal(
 		await run('.x{--tw-scale-x:95%;--tw-scale-y:95%;scale:var(--tw-scale-x) var(--tw-scale-y)}'),
-		'.x{scaleX:0.95;scaleY:0.95}',
+		'.x{transform:scaleX(0.95) scaleY(0.95)}',
 	);
-	// literal shorthand args still unroll
+	// --spacing value from the stylesheet governs the spacing-var resolution
+	assert.equal(
+		await run('.r{--spacing:8}.x{--tw-translate-y:calc(var(--spacing) * 2)}'),
+		'.r{--spacing:8}.x{transform:translateY(16)}',
+	);
+	// literal shorthand args unroll into transform functions
 	assert.equal(
 		await run('.x{translate:10px 20px;scale:0.5}'),
-		'.x{translateX:10px;translateY:20px;scaleX:0.5;scaleY:0.5}',
+		'.x{transform:translateX(10) translateY(20) scaleX(0.5) scaleY(0.5)}',
 	);
 });
 
